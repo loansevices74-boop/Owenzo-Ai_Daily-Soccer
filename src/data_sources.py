@@ -25,19 +25,27 @@ def _event_row(event, league):
     status = event.get("status", {}).get("type", {})
     return {"fixture_id": str(event.get("id", "")), "date": pd.to_datetime(event.get("date"), utc=True, errors="coerce"), "home_team": home.get("team", {}).get("displayName", ""), "away_team": away.get("team", {}).get("displayName", ""), "league": league, "status": status.get("name", "STATUS_UNKNOWN"), "status_detail": status.get("detail", "")}
 
-def load_fixtures(leagues, start, end=None, timeout=20):
+def load_fixtures_with_status(leagues, start: date, end: date | None = None, timeout: int = 20):
     end = end or start
-    rows = []
+    rows, source_status = [], {}
     for league in leagues:
+        slug = LEAGUES[league][0]
         try:
-            response = requests.get(f"{BASE}/{LEAGUES[league][0]}/scoreboard", params={"dates": f"{start:%Y%m%d}-{end:%Y%m%d}", "limit": 500}, timeout=timeout)
+            response = requests.get(f"{BASE}/{slug}/scoreboard", params={"dates": f"{start:%Y%m%d}-{end:%Y%m%d}", "limit": 500}, timeout=timeout)
             response.raise_for_status()
-            rows.extend(row for row in (_event_row(event, league) for event in response.json().get("events", [])) if row)
-        except (requests.RequestException, ValueError, TypeError):
-            continue
+            events = response.json().get("events", [])
+            source_status[league] = {"ok": True, "fixtures": len(events), "error": ""}
+            rows.extend(row for row in (_event_row(event, league) for event in events) if row)
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            source_status[league] = {"ok": False, "fixtures": 0, "error": str(exc)}
     if not rows:
-        return pd.DataFrame(columns=EMPTY)
-    return pd.DataFrame(rows).drop_duplicates("fixture_id").sort_values("date").reset_index(drop=True)
+        frame = pd.DataFrame(columns=EMPTY)
+    else:
+        frame = pd.DataFrame(rows).drop_duplicates("fixture_id").sort_values("date").reset_index(drop=True)
+    return frame, source_status
+
+def load_fixtures(leagues, start, end=None, timeout=20):
+    return load_fixtures_with_status(leagues, start, end, timeout)[0]
 
 def load_league_history(league, season="2526", timeout=20):
     code = LEAGUES[league][1]
