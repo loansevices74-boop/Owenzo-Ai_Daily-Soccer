@@ -3,15 +3,17 @@ import streamlit as st
 from datetime import date, timedelta
 from src.data_sources import LEAGUES, load_fixtures_with_status, load_history
 from src.model import SoccerModel
+from src.reliability import walk_forward, reliability_summary, reliability_table
 from src.accumulator import build_six_leg_accumulator
 
 st.set_page_config(page_title="Owenzo AI Daily Soccer", page_icon="⚽", layout="wide")
 st.title("⚽ Owenzo AI Daily Soccer")
-st.caption("Real fixtures only. Selections combine Poisson scoring, Elo strength, form and data-quality checks.")
+st.caption("Real fixtures only. Predictions are estimates; reliability is measured separately from probability.")
 with st.sidebar:
     selected = st.multiselect("Leagues", list(LEAGUES), default=list(LEAGUES)[:12])
     threshold = st.slider("Minimum adjusted probability", 0.60, 0.80, 0.70, 0.01)
     view = st.radio("Fixture window", ["Today", "Next 7 days"])
+    backtest_days = st.selectbox("Reliability window", [90, 180, 365], index=2)
     refresh = st.button("Clear cache and refresh", type="primary")
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -22,9 +24,13 @@ def fetch_fixtures(selected_leagues, start, end):
 def fetch_history(selected_leagues):
     return load_history(list(selected_leagues))
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_backtest(selected_leagues, days):
+    history = load_history(list(selected_leagues))
+    return walk_forward(history, min_training_matches=30, max_days=days)
+
 if refresh:
-    st.cache_data.clear()
-    st.session_state.pop("fixture_key", None)
+    st.cache_data.clear(); st.session_state.pop("fixture_key", None)
 start = date.today(); end = start if view == "Today" else start + timedelta(days=6)
 key = (tuple(selected), start.isoformat(), end.isoformat())
 if st.session_state.get("fixture_key") != key:
@@ -35,8 +41,8 @@ fixtures = st.session_state.fixtures
 st.metric("Real fixtures received", len(fixtures))
 st.caption(f"UTC window: {start.isoformat()} to {end.isoformat()} | Fixture cache: 5 minutes")
 with st.expander("Source diagnostics"):
-    diagnostic_rows = [{"League": league, "Status": "OK" if info["ok"] else "ERROR", "Events returned": info["fixtures"], "Error": info["error"]} for league, info in st.session_state.source_status.items()]
-    st.dataframe(pd.DataFrame(diagnostic_rows), use_container_width=True, hide_index=True)
+    rows = [{"League": k, "Status": "OK" if v["ok"] else "ERROR", "Events returned": v["fixtures"], "Error": v["error"]} for k, v in st.session_state.source_status.items()]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 if fixtures.empty:
     st.warning("No real fixtures were returned. No simulated fixtures or selections are shown.")
     st.stop()
@@ -53,13 +59,12 @@ for fixture in fixtures.itertuples():
     analysis.append(item)
 
 st.subheader("Best model selections")
-st.caption("A selection is shown only when its adjusted probability clears the threshold. The model can recommend safer markets such as double chance or goals.")
-qualified = [item for item in analysis if item["adjusted_probability"] >= threshold and item["tier"] != "Avoid"]
+st.caption("Selections require the probability threshold. Reliability below is historical and does not guarantee future results.")
+qualified = [x for x in analysis if x["adjusted_probability"] >= threshold and x["tier"] != "Avoid"]
 if qualified:
-    table = pd.DataFrame([{**p, "Probability": f"{p['adjusted_probability']:.1%}", "Fair odds": f"{p['fair_odds']:.2f}", "Model 1X2": f"{p['confidence']:.1%}"} for p in qualified])
-    st.dataframe(table[["league", "kickoff", "home_team", "away_team", "recommended_market", "Probability", "Fair odds", "tier", "data_quality", "Model 1X2", "status"]].rename(columns={"league":"League", "kickoff":"Kickoff", "home_team":"Home", "away_team":"Away", "recommended_market":"Market", "tier":"Tier", "data_quality":"Data quality", "status":"Status"}), use_container_width=True, hide_index=True)
-else:
-    st.info("No real fixture clears the current threshold. No selection is invented.")
+    table = pd.DataFrame([{**p, "Probability": f"{p['adjusted_probability']:.1%}", "Fair odds": f"{p['fair_odds']:.2f}"} for p in qualified])
+    st.dataframe(table[["league", "kickoff", "home_team", "away_team", "recommended_market", "Probability", "Fair odds", "tier", "data_quality", "status"]].rename(columns={"league":"League", "kickoff":"Kickoff", "home_team":"Home", "away_team":"Away", "recommended_market":"Market", "tier":"Tier", "data_quality":"Data quality", "status":"Status"}), use_container_width=True, hide_index=True)
+else: st.info("No real fixture clears the current threshold. No selection is invented.")
 
 with st.expander("Selection details and reasons"):
     for item in sorted(qualified, key=lambda x: x["adjusted_probability"], reverse=True):
@@ -67,13 +72,36 @@ with st.expander("Selection details and reasons"):
         st.write(f"Tier: {item['tier']} | Data quality: {item['data_quality']} | Historical matches: {item['home_matches']}–{item['away_matches']} | xG: {item['home_xg']:.2f}–{item['away_xg']:.2f}")
         st.write(f"Home form: {item['home_form']:.1%} | Away form: {item['away_form']:.1%} | Elo: {item['home_elo']:.0f}–{item['away_elo']:.0f}")
         for reason in item["reasons"]: st.write(f"- {reason}")
-        st.write("Market probabilities: " + " | ".join(f"{name}: {prob:.1%}" for name, prob in item["markets"].items()))
+        st.write("Market probabilities: " + " | ".join(f"{n}: {p:.1%}" for n, p in item["markets"].items()))
 
 st.subheader("Watchlist")
-watchlist = [item for item in analysis if 0.60 <= item["adjusted_probability"] < threshold]
+watchlist = [x for x in analysis if 0.60 <= x["adjusted_probability"] < threshold]
 if watchlist:
     st.dataframe(pd.DataFrame([{ "Match": f"{p['home_team']} vs {p['away_team']}", "Market": p["recommended_market"], "Probability": f"{p['adjusted_probability']:.1%}", "Tier": p["tier"], "Data quality": p["data_quality"] } for p in watchlist]), use_container_width=True, hide_index=True)
 else: st.info("No watchlist matches in the current window.")
+
+st.divider(); st.subheader("Model reliability")
+st.caption("Walk-forward evaluation trains only on matches before each historical prediction date. Results are descriptive, not predictive.")
+if history.empty:
+    st.info("Reliability unavailable because historical results could not be loaded.")
+else:
+    with st.spinner("Running leakage-safe historical evaluation…"):
+        backtest = fetch_backtest(tuple(selected), backtest_days)
+    summary = reliability_summary(backtest)
+    if summary["count"] < 50:
+        st.warning(f"Only {summary['count']} walk-forward predictions are available. Reliability is not established until the sample is larger.")
+    else:
+        cols = st.columns(5)
+        cols[0].metric("Predictions", summary["count"])
+        cols[1].metric("Hit rate", f"{summary['accuracy']:.1%}")
+        cols[2].metric("Brier score", f"{summary['brier']:.3f}")
+        cols[3].metric("Log loss", f"{summary['log_loss']:.3f}")
+        cols[4].metric("Calibration gap", f"{summary['calibration_gap']:+.1%}")
+        st.dataframe(reliability_table(backtest).style.format({"Average probability":"{:.1%}", "Actual hit rate":"{:.1%}", "Calibration gap":"{:+.1%}"}), use_container_width=True, hide_index=True)
+        by_market = backtest.groupby("market").agg(Predictions=("outcome", "size"), HitRate=("outcome", "mean"), Brier=("brier", "mean")).reset_index()
+        st.dataframe(by_market.style.format({"HitRate":"{:.1%}", "Brier":"{:.3f}"}), use_container_width=True, hide_index=True)
+        if summary["calibration_gap"] < -0.05: st.error("Recent evaluation indicates model overconfidence. Selections should be treated cautiously.")
+        elif summary["calibration_gap"] > 0.05: st.info("The model is conservative in this evaluation window.")
 
 st.subheader("Daily six-leg accumulator")
 if view == "Today":
